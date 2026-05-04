@@ -1,0 +1,56 @@
+{
+  "_comment": [
+    "Example Xray outbound that routes ALL traffic through the local SOCKS5",
+    "proxy provided by `tunnel entry` (default 127.0.0.1:1080).",
+    "Drop this 'outbounds' section into your existing Xray config on the Iran VPS."
+  ],
+
+  "outbounds": [
+    {
+      "tag": "tunnel-out",
+      "protocol": "socks",
+      "settings": {
+        "servers": [
+          {
+            "address": "127.0.0.1",
+            "port": 1080
+          }
+        ]
+      },
+      "streamSettings": {
+        "sockopt": {
+          "tcpKeepAliveInterval": 30
+        }
+      }
+    },
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    },
+    {
+      "tag": "block",
+      "protocol": "blackhole"
+    }
+  ],
+
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      {
+        "type": "field",
+        "ip": ["geoip:private"],
+        "outboundTag": "direct"
+      },
+      {
+        "type": "field",
+        "domain": ["geosite:category-ir", "regexp:\\.ir$"],
+        "outboundTag": "direct"
+      },
+      {
+        "type": "field",
+        "outboundTag": "tunnel-out",
+        "network": "tcp,udp"
+      }
+    ]
+  }
+}

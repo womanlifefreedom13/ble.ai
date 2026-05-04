@@ -1,8 +1,8 @@
 """
 Entry node — Iran side.
 
-Starts a SOCKS5 server on socks_host:socks_port.
-Each TCP connection is multiplexed over a LiveKit DataChannel as framed messages.
+Starts a SOCKS5 server on socks_host:socks_port. Each TCP connection is
+multiplexed over a LiveKit DataChannel as framed messages.
 """
 
 import asyncio
@@ -22,7 +22,6 @@ from .bale_token import get_token
 
 logger = logging.getLogger(__name__)
 
-# --- Task registry (prevents GC of fire-and-forget tasks) ---
 _tasks: set = set()
 
 
@@ -33,26 +32,32 @@ def _spawn(coro):
     return t
 
 
-# --- Per-connection state ---
 _streams: dict = {}          # stream_id -> asyncio.StreamWriter (SOCKS client)
-_pending: dict = {}          # stream_id -> asyncio.Future (resolved by CONNECTED frame)
+_pending: dict = {}          # stream_id -> asyncio.Future (resolved by CONNECTED)
 _stream_id_counter = itertools.count(1)
 
-# Module-level room reference (replaced on reconnect)
 _room: rtc.Room | None = None
 _cfg: dict = {}
 
 
 def _next_stream_id() -> int:
-    sid = next(_stream_id_counter)
-    return sid & 0xFFFFFFFF  # clamp to uint32
+    return next(_stream_id_counter) & 0xFFFFFFFF
 
 
-# --- LiveKit data_received callback (must be synchronous) ---
+def _enable_tcp_keepalive(sock: socket.socket) -> None:
+    """Enable TCP keepalive so idle SSH/long-poll connections survive NAT/firewall idle timers."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        # Linux-specific tuning; ignore on macOS/BSD
+        for opt, val in (("TCP_KEEPIDLE", 60), ("TCP_KEEPINTVL", 30), ("TCP_KEEPCNT", 5)):
+            if hasattr(socket, opt):
+                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), val)
+    except OSError as e:
+        logger.debug("Could not set TCP keepalive: %s", e)
+
 
 def _on_data_received(packet: rtc.DataPacket):
     if packet.participant is None:
-        # Ignore loopback (shouldn't happen but be defensive)
         return
     try:
         stream_id, msg_type, payload = decode_frame(packet.data)
@@ -93,17 +98,15 @@ async def _close_writer(writer: asyncio.StreamWriter):
         pass
 
 
-# --- SOCKS5 handshake ---
+# --- SOCKS5 ---
 
 async def _socks5_negotiate(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    """Handle SOCKS5 method negotiation — accept no-auth only."""
     header = await reader.readexactly(2)
     if header[0] != 0x05:
         raise ValueError(f"Not SOCKS5 (ver={header[0]:#x})")
-    n_methods = header[1]
-    methods = await reader.readexactly(n_methods)
+    methods = await reader.readexactly(header[1])
     if 0x00 not in methods:
-        writer.write(b"\x05\xFF")  # no acceptable method
+        writer.write(b"\x05\xFF")
         await writer.drain()
         raise ValueError("Client does not support no-auth SOCKS5")
     writer.write(b"\x05\x00")
@@ -111,39 +114,36 @@ async def _socks5_negotiate(reader: asyncio.StreamReader, writer: asyncio.Stream
 
 
 async def _socks5_read_request(reader: asyncio.StreamReader) -> tuple:
-    """Parse SOCKS5 CONNECT request. Returns (host, port)."""
     hdr = await reader.readexactly(4)
     ver, cmd, _rsv, atyp = hdr
     if ver != 0x05:
-        raise ValueError(f"Unexpected SOCKS version in request: {ver}")
+        raise ValueError(f"Unexpected SOCKS version: {ver}")
     if cmd != 0x01:
         raise ValueError(f"Only CONNECT (0x01) supported, got {cmd:#x}")
 
-    if atyp == 0x01:        # IPv4
-        addr_b = await reader.readexactly(4)
-        host = socket.inet_ntop(socket.AF_INET, addr_b)
-    elif atyp == 0x03:      # domain name
+    if atyp == 0x01:
+        host = socket.inet_ntop(socket.AF_INET, await reader.readexactly(4))
+    elif atyp == 0x03:
         n = (await reader.readexactly(1))[0]
         host = (await reader.readexactly(n)).decode()
-    elif atyp == 0x04:      # IPv6
-        addr_b = await reader.readexactly(16)
-        host = socket.inet_ntop(socket.AF_INET6, addr_b)
+    elif atyp == 0x04:
+        host = socket.inet_ntop(socket.AF_INET6, await reader.readexactly(16))
     else:
         raise ValueError(f"Unknown ATYP: {atyp:#x}")
 
-    port_b = await reader.readexactly(2)
-    port = struct.unpack(">H", port_b)[0]
+    port = struct.unpack(">H", await reader.readexactly(2))[0]
     return host, port
 
 
-_SOCKS5_SUCCESS  = b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00"
-_SOCKS5_REFUSED  = b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00"
-_SOCKS5_UNREACH  = b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00"
+_SOCKS5_SUCCESS = b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+_SOCKS5_REFUSED = b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00"
+_SOCKS5_UNREACH = b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00"
 
-
-# --- Per-connection handler ---
 
 async def _handle_socks_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    sock = writer.get_extra_info("socket")
+    if sock is not None:
+        _enable_tcp_keepalive(sock)
     peer = writer.get_extra_info("peername")
     try:
         await _socks5_negotiate(reader, writer)
@@ -156,16 +156,13 @@ async def _handle_socks_client(reader: asyncio.StreamReader, writer: asyncio.Str
     stream_id = _next_stream_id()
     logger.debug("[%d] CONNECT %s:%d", stream_id, host, port)
 
-    loop = asyncio.get_event_loop()
-    fut: asyncio.Future = loop.create_future()
+    fut: asyncio.Future = asyncio.get_event_loop().create_future()
     _pending[stream_id] = fut
     _streams[stream_id] = writer
 
-    # Send CONNECT frame to exit node
     try:
         await _room.local_participant.publish_data(
-            payload=encode_connect(stream_id, host, port),
-            reliable=True,
+            payload=encode_connect(stream_id, host, port), reliable=True,
         )
     except Exception as e:
         logger.warning("[%d] publish_data(CONNECT) failed: %s", stream_id, e)
@@ -176,7 +173,6 @@ async def _handle_socks_client(reader: asyncio.StreamReader, writer: asyncio.Str
         writer.close()
         return
 
-    # Wait for exit node to confirm the TCP connection
     try:
         ok = await asyncio.wait_for(fut, timeout=15.0)
     except asyncio.TimeoutError:
@@ -188,30 +184,27 @@ async def _handle_socks_client(reader: asyncio.StreamReader, writer: asyncio.Str
         return
 
     if not ok:
-        logger.debug("[%d] Exit node refused connection to %s:%d", stream_id, host, port)
+        logger.debug("[%d] Exit refused %s:%d", stream_id, host, port)
         _streams.pop(stream_id, None)
         writer.write(_SOCKS5_REFUSED)
         await writer.drain()
         writer.close()
         return
 
-    # Tell SOCKS client the connection succeeded
     writer.write(_SOCKS5_SUCCESS)
     await writer.drain()
     logger.info("[%d] Tunnel open: %s:%d", stream_id, host, port)
 
-    # Forward client → DataChannel until EOF or error
+    # Forward client → DataChannel until EOF or error.
+    # No asyncio idle timeout: TCP keepalive (above) handles dead peers.
     try:
         while True:
-            chunk = await asyncio.wait_for(reader.read(MAX_PAYLOAD), timeout=300.0)
+            chunk = await reader.read(MAX_PAYLOAD)
             if not chunk:
                 break
             await _room.local_participant.publish_data(
-                payload=encode_data(stream_id, chunk),
-                reliable=True,
+                payload=encode_data(stream_id, chunk), reliable=True,
             )
-    except asyncio.TimeoutError:
-        logger.debug("[%d] Client idle timeout", stream_id)
     except (ConnectionResetError, BrokenPipeError, OSError) as e:
         logger.debug("[%d] Client connection error: %s", stream_id, e)
     except Exception as e:
@@ -220,8 +213,7 @@ async def _handle_socks_client(reader: asyncio.StreamReader, writer: asyncio.Str
         _streams.pop(stream_id, None)
         try:
             await _room.local_participant.publish_data(
-                payload=encode_close(stream_id),
-                reliable=True,
+                payload=encode_close(stream_id), reliable=True,
             )
         except Exception:
             pass
@@ -236,7 +228,6 @@ async def _handle_socks_client(reader: asyncio.StreamReader, writer: asyncio.Str
 # --- Reconnect logic ---
 
 def _cleanup_all_streams():
-    """Cancel all pending futures and close all writers on disconnect."""
     for fut in _pending.values():
         if not fut.done():
             fut.cancel()
@@ -263,14 +254,12 @@ async def _connect_with_backoff(room: rtc.Room, url: str, token: str):
 
 
 async def _on_disconnect(reason):
-    global _room
     logger.warning("LiveKit disconnected (reason=%s), reconnecting...", reason)
     _cleanup_all_streams()
+    # Re-fetch token in case it was rotated (file/env-var modes).
     token = await get_token(_cfg, "entry")
     await _connect_with_backoff(_room, _cfg["livekit_url"], token)
 
-
-# --- Public entry point ---
 
 async def run_entry(cfg: dict):
     global _room, _cfg

@@ -10,7 +10,7 @@ Each LiveKit publishData call carries exactly one frame (atomic delivery).
 import struct
 
 HEADER_SIZE = 9          # 4 + 1 + 4
-MAX_PAYLOAD = 8192
+MAX_PAYLOAD = 14000      # LiveKit reliable channel ≈ 16 KB; leave headroom
 
 MSG_CONNECT   = 0x01
 MSG_DATA      = 0x02
@@ -38,6 +38,8 @@ def decode_frame(data: bytes) -> tuple:
 def encode_connect(stream_id: int, host: str, port: int) -> bytes:
     """CONNECT: 1B host_len + host bytes + 2B port (big-endian)."""
     host_b = host.encode()
+    if len(host_b) > 255:
+        raise ValueError(f"Hostname too long: {len(host_b)} bytes")
     payload = bytes([len(host_b)]) + host_b + struct.pack(">H", port)
     return encode_frame(stream_id, MSG_CONNECT, payload)
 

@@ -1,0 +1,26 @@
+[Unit]
+Description=Bale/LiveKit WebRTC tunnel — Iran side (SOCKS5 entry)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tunnel
+Group=tunnel
+WorkingDirectory=/opt/ble-ai
+ExecStart=/opt/ble-ai/.venv/bin/python -m tunnel entry --config /etc/tunnel/settings.json
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/tunnel
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

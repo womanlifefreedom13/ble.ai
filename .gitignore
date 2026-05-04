@@ -1,0 +1,24 @@
+# Secrets / local config — never commit
+settings.json
+*.token
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Build artifacts
+build/
+dist/
+*.tar.gz
+bootstrap-*.sh
+!bootstrap.sh
